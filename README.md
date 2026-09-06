@@ -1,3 +1,6 @@
+## Workshop Link: 
+https://steamcommunity.com/sharedfiles/filedetails/?id=3796515975
+
 # AdminModDW
 
 **Chivalry: Deadliest Warrior** server mod: remote admin console and first-person spectator.

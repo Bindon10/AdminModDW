@@ -1,0 +1,3 @@
+class AdminModDWFFAPlayerController extends AOCFFAPlayerController;
+
+`include(AdminModDW/Include/AdminModDWPlayerController.uci)

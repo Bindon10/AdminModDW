@@ -1,0 +1,3 @@
+class AdminModDWLTSPlayerController extends AOCLTSPlayerController;
+
+`include(AdminModDW/Include/AdminModDWPlayerController.uci)

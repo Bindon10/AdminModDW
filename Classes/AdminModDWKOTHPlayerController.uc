@@ -1,0 +1,3 @@
+class AdminModDWKOTHPlayerController extends AOCKOTHPlayerController;
+
+`include(AdminModDW/Include/AdminModDWPlayerController.uci)

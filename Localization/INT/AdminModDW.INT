@@ -1,0 +1,9 @@
+; AdminModDW localized strings.
+;
+; AdminModDW adds no weapons, classes or UI, so there is nothing to localise -- but the
+; cooker copies Development\Src\<Mod>\Localization unconditionally and fails the build
+; if the folder is missing, so this file exists to satisfy that step.
+;
+; Sections here are [ClassName] with one Key=Value per var localized on that class.
+
+[ChatMessages]

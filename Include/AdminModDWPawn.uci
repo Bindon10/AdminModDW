@@ -1,0 +1,62 @@
+/**
+ * First-person spectator, pawn side. Included by every AdminModDW pawn class.
+ *
+ * AdminModDW changes no gameplay -- this override exists only so a spectator can see
+ * through another player's eyes.
+ *
+ * DW delta, and it is a large one. The base-game AdminMod carries ~250 lines here for two
+ * problems that Deadliest Warrior does not have:
+ *
+ *  1. Rebuilding the stripped 1P mesh. In the base game AOCPawn.SetCharacterAppearance
+ *     DetachComponent()s OwnerMesh on every pawn that was not locally controlled when its
+ *     character assets loaded, so BecomeFirstPersonObserved has nothing to put a mesh on.
+ *     Deadliest Warrior predates the customization system: OwnerMesh is a plain default
+ *     subobject (AOCPawn.uc:11008), the only thing done to it is SetHidden (AOCPawn.uc:7219,
+ *     with the DetachComponent commented out beside it), and BecomeFirstPersonObserved
+ *     assigns the mesh itself from PawnCharacter (AOCPawn.uc:10639). Nothing to rebuild.
+ *
+ *  2. The camera-socket fallback. That override hooked AOCPawn's
+ *     GetCameraSocketLocationAndRotation. Deadliest Warrior has no such function --
+ *     AOCPlayerCamera.UpdateCamera (:82) calls GetSocketWorldLocationAndRotation on the
+ *     mesh component directly, so there is no script hook to interpose on. The pre-flight
+ *     check in AdminModDWPlayerController.AdminModDWFPObserveBlocker is what keeps a pawn
+ *     with no usable 1P mesh out of first person in the first place.
+ *
+ * What is left is the feint fix below, which Deadliest Warrior needs exactly as the base
+ * game does.
+ */
+
+/* ************************************************************************
+ * FEINT / BLEND RESET WHILE FIRST-PERSON OBSERVED
+ *
+ * AOCPawn.ResetBlends() (AOCPawn.uc:5061) opens with:
+ *
+ *   if (bReplicated && WorldInfo.NetMode != NM_DedicatedServer
+ *       && ((IsLocallyControlled() && !bIsBot) || bIsBeingFPObserved))
+ *       return;
+ *
+ * The bIsBeingFPObserved half assumes a first-person-observed pawn is OUR pawn, so the
+ * local reset (bReplicated = false) has already run and the replicated one is redundant.
+ * That holds for your own pawn. It is false for a remote pawn you are spectating: nothing
+ * on this client ever ran the local reset.
+ *
+ * A feint goes ManualReset() -> replicate SResetBlends -> remote clients receive it in
+ * ReplicatedEvent and call ResetBlends(ResetTime) with bReplicated defaulted TRUE. For the
+ * pawn we are first-person observing that call returns immediately, the blends are never
+ * cleared, and the weapon stays stuck in its feinted pose on the spectator's screen.
+ *
+ * Run it as a local reset rather than skipping it.
+ **************************************************************************/
+simulated function ResetBlends(optional float BlendOutTime = 0.3f, optional bool bReplicated = true)
+{
+	if (bReplicated && bIsBeingFPObserved && !IsLocallyControlled())
+	{
+		// bReplicated = false clears vanilla's early-out and performs the real reset,
+		// which also calls AOCWeaponAttachment.ResetAnimation() -- the bit that puts
+		// the weapon back to idle.
+		super.ResetBlends(BlendOutTime, false);
+		return;
+	}
+
+	super.ResetBlends(BlendOutTime, bReplicated);
+}

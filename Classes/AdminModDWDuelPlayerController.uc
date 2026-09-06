@@ -1,0 +1,3 @@
+class AdminModDWDuelPlayerController extends CDWDuelPlayerController;
+
+`include(AdminModDW/Include/AdminModDWPlayerController.uci)

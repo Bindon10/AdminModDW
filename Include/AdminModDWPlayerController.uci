@@ -1,0 +1,923 @@
+/**
+ * Shared player-controller code for AdminModDW. Included by every AdminModDW
+ * PlayerController.
+ *
+ * Two things live here: opcodes 26/48 (inebriate / sober up), and first-person spectate.
+ *
+ * Inebriate: opcodes 26/48.
+ *
+ * DW delta, and it is good news. In the base game the drunk and blackout nodes live in a
+ * SEPARATE chain (ChivPostProcess_drunk) while the default chain is ChivPostProcess_noToneMap,
+ * so most maps carry no drunk effect and the base mod has to swap the whole chain in -- which
+ * is why inebriate was long believed to be TO2-only there.
+ *
+ * Deadliest Warrior put the nodes in the DEFAULT chain instead. CHV_PPC_Pack ships exactly two
+ * chains, ChivPostProcess_noToneMap and ChivPostProcess_characterToScaleformRenderTarget, and
+ * carries the DrunkEffect and blackout effects; DefaultPostProcessName (CDWEngine.ini:140) is
+ * noToneMap. That is why the Pirate's flaming rum works out of the box with no chain swap.
+ *
+ * So on stock DW AdminModDWHasDrunkEffects() is true on every map and the swap below never
+ * runs. It is kept as a fallback for a map that replaces the chain with one lacking the drunk
+ * nodes: set AdminModDWDrunkChainPath to a chain that has them and it will be swapped in.
+ * Empty by default, because DW has no separate drunk chain to point at.
+ */
+
+// Declared up here because UnrealScript requires every var before the first function in
+// the class body -- and this .uci is pasted straight into one.
+var string           AdminModDWDrunkChainPath; // asset path, resolved lazily -- see above
+var PostProcessChain AdminModDWDrunkChain;     // resolved chain, or none if the path misses
+var bool             bAdminModDWDrunkChainTried;
+var bool             bAdminModDWDrunkChainAdded; // true only when WE swapped the chain, so only we restore it
+
+// First-person spectator (see the FIRST-PERSON SPECTATOR block further down).
+var bool    bAdminModDWFPSpectate;      // desired perspective while following a player
+var AOCPawn AdminModDWFPObservedPawn;   // pawn we currently have first-person-observer state applied to
+var AOCPawn AdminModDWHUDPawn;          // pawn the spectator health/stamina HUD is currently showing
+var AOCPawn AdminModDWPerspectivePawn;  // pawn we have already established a camera perspective for
+var float   fAdminModDWNextFPRetry;     // TimeSeconds gate for re-trying first person on a pawn
+var AOCPawn AdminModDWFPBlockLoggedPawn; // pawn whose first-person refusal we have already logged
+
+// Health/stamina bar enforcement (see AdminModDWEnforceLifeBars).
+var AOCPawn AdminModDWLifeBarPawn;
+var float   fAdminModDWNextLifeBarAssert;
+var int     iAdminModDWLastHealthShown;
+var float   fAdminModDWLastStaminaShown;
+
+// Spectator field-of-view lock (see AdminModDWEnforceSpectateFOV).
+var float   fAdminModDWFOVCaught;       // last wrong FOV value we corrected while spectating
+var name    nAdminModDWFOVCaughtWhere;  // which hook caught it -- reported by FPSpectateDebug
+
+// Spectator team lock (see AdminModDWMayView).
+var int     iAdminModDWViewBlocks;      // times we refused an out-of-team view target
+var name    nAdminModDWViewBlockWhere;  // which hook refused it, for FPSpectateDebug
+
+
+/** Resolve the drunk chain once. None is a valid, handled answer. */
+simulated function PostProcessChain AdminModDWGetDrunkChain()
+{
+	if (bAdminModDWDrunkChainTried)
+		return AdminModDWDrunkChain;
+
+	bAdminModDWDrunkChainTried = true;
+
+	if (AdminModDWDrunkChainPath == "")
+	{
+		// Expected on stock DW: the default chain already has the effects, so we only get
+		// here on a map that swapped the chain for one without them.
+		LogAlwaysInternal("[AdminModDW] this map's post-process chain has no drunk effect and"
+			@ "no replacement chain is configured (AdminModDWDrunkChainPath is empty).");
+		return none;
+	}
+
+	AdminModDWDrunkChain = PostProcessChain(DynamicLoadObject(AdminModDWDrunkChainPath, class'PostProcessChain', true));
+
+	if (AdminModDWDrunkChain == none)
+		LogAlwaysInternal("[AdminModDW] drunk post-process chain not found at" @ AdminModDWDrunkChainPath);
+
+	return AdminModDWDrunkChain;
+}
+
+/** True when the active chain can already render the drunk effect. */
+simulated function bool AdminModDWHasDrunkEffects()
+{
+	local LocalPlayer LP;
+
+	LP = LocalPlayer(Player);
+	if (LP == none || LP.PlayerPostProcess == none)
+		return false;
+
+	// Both are needed: ToggleDrunkPostEffects dereferences BlackoutEffect and its material
+	// instance with no none-check, so a chain with only one of the two is worse than neither.
+	return LP.PlayerPostProcess.FindPostProcessEffect('drunkeffect') != none
+		&& LP.PlayerPostProcess.FindPostProcessEffect('blackout') != none;
+}
+
+/** Makes the drunk effect available on this map, if it is not already. */
+simulated function bool AdminModDWEnsureDrunkChain()
+{
+	local LocalPlayer LP;
+	local PostProcessChain Chain;
+
+	if (AdminModDWHasDrunkEffects())
+		return true;                          // map already brought a chain with it
+
+	Chain = AdminModDWGetDrunkChain();
+
+	LP = LocalPlayer(Player);
+	if (LP == none || myHUD == none || Chain == none)
+		return false;
+
+	// Replace, do not append. These ChivPostProcess_* names are complete chains, not
+	// fragments: appending one leaves two full chains running back to back and the scene is
+	// tone-mapped and bloomed twice. bInClone deep-copies the effects so the shared asset is
+	// never mutated by one player's session. Idiom from GameInfo.uc:1585-1592.
+	LP.RemoveAllPostProcessingChains();
+	if (!LP.InsertPostProcessingChain(Chain, INDEX_NONE, true))
+	{
+		// Put the map back the way it was rather than leaving the player with no chain.
+		AdminModDWRestoreWorldChain();
+		return false;
+	}
+
+	// Re-cache AOCBaseHUD's DrunkEffect / BlackoutEffect pointers against the new chain.
+	myHUD.NotifyBindPostProcessEffects();
+
+	bAdminModDWDrunkChainAdded = AdminModDWHasDrunkEffects();
+	if (!bAdminModDWDrunkChainAdded)
+		AdminModDWRestoreWorldChain();
+
+	return bAdminModDWDrunkChainAdded;
+}
+
+/** Puts the map's own post-process chain back. */
+simulated function AdminModDWRestoreWorldChain()
+{
+	local LocalPlayer LP;
+	local PostProcessChain WorldChain;
+
+	LP = LocalPlayer(Player);
+	if (LP == none)
+		return;
+
+	// Static on Engine (Engine.uc:1039). Reached through class'Engine'.static rather than
+	// LP.Outer so this does not depend on LocalPlayer's within-class.
+	WorldChain = class'Engine'.static.GetWorldPostProcessChain();
+	if (WorldChain == none)
+		WorldChain = class'Engine'.static.GetDefaultPostProcessChain();
+
+	LP.RemoveAllPostProcessingChains();
+	if (WorldChain != none)
+		LP.InsertPostProcessingChain(WorldChain, INDEX_NONE, true);
+
+	if (myHUD != none)
+		myHUD.NotifyBindPostProcessEffects();
+}
+
+/**
+ * Undoes AdminModDWEnsureDrunkChain. Guarded on the flag so that a map which supplied its
+ * own drunk chain keeps it -- on those maps we never swapped anything and must not
+ * "restore".
+ */
+simulated function AdminModDWDropDrunkChain()
+{
+	if (!bAdminModDWDrunkChainAdded)
+		return;
+
+	bAdminModDWDrunkChainAdded = false;
+	AdminModDWRestoreWorldChain();
+}
+
+/**
+ * Adds the chain first when the map has no drunk effect of its own, so inebriate works
+ * everywhere rather than only where the map happened to supply one.
+ *
+ * The sound mode is deliberately not touched here: AOCBaseHUD drives EnableDrunkSoundMode
+ * from its own fade, and that runs on this same client.
+ */
+reliable client function ClientInebriate(bool bEnable)
+{
+	if (AOCBaseHUD(myHUD) == none)
+		return;
+
+	if (bEnable)
+	{
+		if (!AdminModDWEnsureDrunkChain())
+		{
+			ClientDisplayConsoleMessage("Inebriate: no drunk post-process chain available on this map.");
+			return;
+		}
+		super.ClientInebriate(true);
+		return;
+	}
+
+	super.ClientInebriate(false);
+	AdminModDWDropDrunkChain();
+}
+
+
+simulated event PostBeginPlay()
+{
+	super.PostBeginPlay();
+
+	// Follow players in first person by default; Space toggles back to the vanilla orbit
+	// follow. Set here rather than in state Spectating.BeginState so the choice sticks for
+	// the whole session instead of resetting on every re-entry.
+	bAdminModDWFPSpectate = true;
+}
+
+simulated event tick(float DeltaTime)
+{
+	super.tick(DeltaTime);
+
+	// Runs in every state, so it covers both playing and spectating.
+	AdminModDWEnforceLifeBars();
+}
+
+/* ************************************************************************
+ * FIRST-PERSON SPECTATOR -- post-spawn camera correction
+ *
+ * PlayerController.ClientRestart calls SetViewTarget(Pawn) while still inside state
+ * Spectating, and only then EnterStartState(). Two consequences:
+ *
+ * 1. AOCPawn.BecomeViewTarget (AOCPawn.uc:10612) takes its spectator branch whenever
+ *    Controller != PC and never calls super, so UTPawn's possession setup is skipped.
+ * 2. GetPlayerViewPoint reads PlayerCamera and ignores Pawn/ViewTarget whenever one
+ *    exists, so leaving spectate with one alive strands the view on a fixed map spot
+ *    while the pawn plays underneath.
+ *
+ * So the camera is re-asserted one tick after ClientRestart, once the state transition
+ * has actually completed.
+ **************************************************************************/
+
+/**
+ * One-line camera dump to the log. Use with the FPSpectateDebug exec when chasing camera bugs.
+ *
+ * The parameter is Note, not Tag: Actor already has a Tag field, and shadowing it is a
+ * compiler warning on every including class.
+ */
+simulated function AdminModDWLogCameraState(string Note)
+{
+	LogAlwaysInternal("[AdminModDWFPSpec]" @ Note
+		@ "State=" $ GetStateName()
+		@ "Pawn=" $ Pawn
+		@ "ViewTarget=" $ ViewTarget
+		@ "PlayerCamera=" $ PlayerCamera
+		@ "bBehindView=" $ bBehindView
+		@ "bFreeCamera=" $ bFreeCamera
+		@ "PCLoc=" $ Location);
+}
+
+/** Fired on a short timer from ClientRestart, after EnterStartState has run. */
+simulated function AdminModDWFixCameraAfterSpawn()
+{
+	local AOCPawn MyPawn;
+
+	if (!IsLocalPlayerController())
+		return;
+
+	AdminModDWLogCameraState("post-spawn");
+
+	if (Pawn == none || IsInState('Spectating'))
+		return;
+
+	// (2) above -- a surviving PlayerCamera outranks Pawn and ViewTarget entirely.
+	if (PlayerCamera != none)
+	{
+		PlayerCamera.Destroy();
+		PlayerCamera = none;
+	}
+
+	// The spectator camera drove this and nothing on the spawn path clears it.
+	bFreeCamera = false;
+
+	// (1) above -- force the view target transition to happen again, now that we are
+	// out of Spectating, so AOCPawn.BecomeViewTarget takes its normal branch.
+	MyPawn = AOCPawn(Pawn);
+	if (MyPawn != none)
+	{
+		MyPawn.bIsBeingFPObserved = false;
+		MyPawn.CurrentObserver = none;
+	}
+
+	SetViewTarget(none);
+	SetViewTarget(Pawn);
+
+	// state Spectating.GetPlayerViewPoint has been SetLocation()-ing this controller
+	// onto the spectator camera position every frame.
+	SetLocation(Pawn.Location);
+
+	AdminModDWLogCameraState("post-spawn-corrected");
+}
+
+reliable client function ClientRestart(Pawn NewPawn)
+{
+	super.ClientRestart(NewPawn);
+
+	if (NewPawn != none && IsLocalPlayerController())
+		SetTimer(0.05f, false, 'AdminModDWFixCameraAfterSpawn');
+}
+
+/* ************************************************************************
+ * FIRST-PERSON SPECTATOR
+ *
+ * Vanilla already has a complete FP-observer path -- bIsBeingFPObserved gates the 1P mesh,
+ * the camera socket (AOCPlayerCamera.uc:82), the overlay weapon and the HUD push -- but
+ * nothing drives it: state Spectating.ViewAPlayer force-calls SetBehindView(true) on every
+ * target change and BehindView() is an empty stub.
+ *
+ * AdminModDW re-declares state Spectating to route target changes through it. Once
+ * bIsBeingFPObserved is actually set, AOCPlayerCamera.UpdateCamera takes its FP branch and
+ * SetThirdPersonCamera(false) shows the 1P mesh, so there is no head to hide.
+ *
+ * First person by default; Space toggles the vanilla orbit follow, right click still
+ * detaches to free camera.
+ ************************************************************************** */
+
+/**
+ * Why first-person observe cannot be applied to this pawn, or "" when it can. One source of
+ * truth so the diagnostic and the decision cannot drift.
+ *
+ * Every item is something Deadliest Warrior's BecomeFirstPersonObserved (AOCPawn.uc:10632)
+ * or SetThirdPersonCamera (AOCPawn.uc:6384) dereferences unguarded, and a pawn can be
+ * network-relevant before it has them all. That list differs from the base game's: DW has
+ * no CharacterAssetStore, its helmet is HelmetAttachment.SkelComp rather than
+ * HelmetMeshComp, and SetThirdPersonCamera additionally touches the weapon attachment's
+ * ArrowComp.
+ *
+ * OwnerMesh.SkeletalMesh is deliberately NOT required: BecomeFirstPersonObserved is what
+ * assigns it, from PawnCharacter, so demanding it up front would refuse every pawn that has
+ * not been observed yet. PawnCharacter and its OwnerMesh asset are checked instead.
+ */
+simulated function string AdminModDWFPObserveBlocker(AOCPawn P)
+{
+	if (P == none)
+		return "pawn is none";
+	if (P.OwnerMesh == none)
+		return "OwnerMesh component is none";
+	if (P.PawnCharacter == none)
+		return "PawnCharacter is none (character info has not been set yet)";
+	if (P.PawnCharacter.default.OwnerMesh == none)
+		return "PawnCharacter has no 1P mesh asset";
+	if (P.HelmetAttachment.SkelComp == none)
+		return "HelmetAttachment.SkelComp is none";
+	if (P.ShieldMesh == none)
+		return "ShieldMesh is none";
+	if (P.OverlayShieldMesh == none)
+		return "OverlayShieldMesh is none";
+	if (AOCWeaponAttachment(P.CurrentWeaponAttachment) == none)
+		return "CurrentWeaponAttachment is not an AOCWeaponAttachment";
+	if (P.CurrentWeaponAttachment.Mesh == none)
+		return "the weapon attachment has no Mesh";
+	if (AOCWeaponAttachment(P.CurrentWeaponAttachment).ArrowComp == none)
+		return "the weapon attachment has no ArrowComp";
+
+	return "";
+}
+
+simulated function bool AdminModDWCanFPObserve(AOCPawn P)
+{
+	return AdminModDWFPObserveBlocker(P) == "";
+}
+
+/**
+ * Puts the observed pawn into real first-person-observer state.
+ *
+ * Ordering trap: state Spectating.SetBehindView(false) reaches
+ * BecomeFirstPersonObserved -> BecomeViewTarget -> SetThirdPersonCamera(!bIsBeingFPObserved),
+ * and the flag is still false at that point -- so it re-runs as SetThirdPersonCamera(TRUE)
+ * before the flag is set. Vanilla's own order leaves the pawn flagged for a 1P camera but
+ * visually in 3P, which is the "inside the head" view. The meshes are put back afterwards.
+ */
+simulated function bool AdminModDWApplyFPObserve(AOCPawn P)
+{
+	local string Blocker;
+
+	if (P == none || !IsLocalPlayerController())
+		return false;
+
+	Blocker = AdminModDWFPObserveBlocker(P);
+	if (Blocker != "")
+	{
+		// Once per pawn: silence is what made this hard to diagnose the first time.
+		if (AdminModDWFPBlockLoggedPawn != P)
+		{
+			AdminModDWFPBlockLoggedPawn = P;
+			LogAlwaysInternal("[AdminModDWFPSpec] first person refused for"@P$":"@Blocker);
+		}
+		return false;
+	}
+
+	if (AdminModDWFPObservedPawn != none && AdminModDWFPObservedPawn != P)
+		AdminModDWClearFPObserve();
+
+	SetBehindView(false);
+	P.SetThirdPersonCamera(false);
+
+	AdminModDWFPObservedPawn = P;
+	return true;
+}
+
+/**
+ * Undoes AdminModDWApplyFPObserve on whichever pawn we last applied it to.
+ * AOCPawn.EndViewTarget() clears bIsBeingFPObserved / CurrentObserver but does NOT restore
+ * mesh visibility, so a pawn we stop following would keep its 1P mesh unhidden and its 3P
+ * body flagged owner-no-see.
+ */
+simulated function AdminModDWClearFPObserve()
+{
+	local AOCPawn P;
+
+	if (AdminModDWFPObservedPawn == none)
+		return;
+
+	P = AdminModDWFPObservedPawn;
+	AdminModDWFPObservedPawn = none;
+
+	P.bIsBeingFPObserved = false;
+	if (P.CurrentObserver == self)
+		P.CurrentObserver = none;
+
+	if (AdminModDWCanFPObserve(P))
+		P.SetThirdPersonCamera(true);
+}
+
+/**
+ * Hand the camera back to the vanilla spectator behaviour.
+ *
+ * AOCPlayerController.state Spectating.SetBehindView dereferences AOCGRI(WorldInfo.GRI)
+ * with no none-check, and this is reachable the instant we enter spectate -- before the GRI
+ * has replicated to a joining client. Fall back to setting the flags directly in that
+ * window; PlayerTick re-establishes properly once a real target arrives.
+ */
+simulated function AdminModDWRestoreVanillaCamera()
+{
+	if (WorldInfo.GRI != none)
+	{
+		SetBehindView(true);
+	}
+	else
+	{
+		bBehindView = true;
+		bFreeCamera = true;
+	}
+}
+
+/**
+ * May we look at this player? Mirrors AOCGame.CanSpectate rather than inventing a second
+ * rule: real spectators see everybody, players see only their own team.
+ *
+ * The difference is WHERE. CanSpectate is server-side and only gates
+ * GetNextViewablePlayer; this is simulated off replicated PRI data, so the client can apply
+ * the same rule to what that gate does not cover -- FP observation and the life bars.
+ */
+simulated function bool AdminModDWMayView(PlayerReplicationInfo TargetPRI)
+{
+	local AOCPRI MyPRI;
+
+	if (TargetPRI == none || PlayerReplicationInfo == none)
+		return false;
+
+	// Dedicated spectators may watch anybody.
+	if (PlayerReplicationInfo.bOnlySpectator)
+		return true;
+
+	MyPRI = AOCPRI(PlayerReplicationInfo);
+	if (MyPRI != none && MyPRI.bIsVoluntarySpectator)
+		return true;
+
+	// On a team: own team only. A player with no team yet gets nothing rather than
+	// everything -- failing closed is the whole point here.
+	return (PlayerReplicationInfo.Team != none && TargetPRI.Team == PlayerReplicationInfo.Team);
+}
+
+/** Records a refusal so FPSpectateDebug can report whether this ever actually fires. */
+simulated function AdminModDWNoteViewBlock(name Where)
+{
+	iAdminModDWViewBlocks++;
+	nAdminModDWViewBlockWhere = Where;
+}
+
+/** Applies whichever perspective the spectator currently wants to the current view target. */
+simulated function AdminModDWApplySpectatorPerspective()
+{
+	local AOCPawn P;
+
+	if (!IsLocalPlayerController())
+		return;
+
+	P = AOCPawn(ViewTarget);
+
+	// Never put a player into first person on somebody they are not allowed to watch.
+	// First person is the worst case of the leak: it hands over the exact view, the health
+	// and stamina bars, and any HUD marker that pawn's team can see.
+	if (P != none && !AdminModDWMayView(P.PlayerReplicationInfo))
+	{
+		AdminModDWNoteViewBlock('Perspective');
+		P = none;
+	}
+
+	if (P == none || P.Health <= 0)
+	{
+		AdminModDWClearFPObserve();
+		AdminModDWPerspectivePawn = none;
+
+		// SetBehindView(false) cleared bFreeCamera. Hand it back, or the free camera can
+		// neither move nor look around -- state Spectating.PlayerMove early-outs on
+		// !bFreeCamera before UpdateRotation.
+		AdminModDWRestoreVanillaCamera();
+		return;
+	}
+
+	AdminModDWPerspectivePawn = P;
+
+	if (bAdminModDWFPSpectate && AdminModDWApplyFPObserve(P))
+		return;
+
+	// Either the spectator asked for the orbit follow, or this pawn cannot be
+	// first-person observed. Falling through to an explicit SetBehindView(true) matters:
+	// vanilla's ViewAPlayer called it on EVERY target change and our override deliberately
+	// does not, so if neither branch here establishes camera state the controller is left
+	// running on whatever bBehindView / bFreeCamera happened to be left over.
+	AdminModDWClearFPObserve();
+	AdminModDWRestoreVanillaCamera();
+}
+
+/**
+ * Keep the health/stamina bars on screen and current for whoever we are looking at -- our
+ * own pawn, or the followed player while spectating.
+ *
+ * Vanilla has too many holes to patch individually: bars are shown only from
+ * ShowHUDElements on possession, DisplayCompleteHUD silently no-ops before the GFx HUD is
+ * built and nobody retries, and nothing shows them for a spectator. So assert the desired
+ * state every tick instead. Throttled to a visibility re-assert twice a second plus a value
+ * push only on change. Never HIDES -- vanilla owns that.
+ */
+simulated function AdminModDWEnforceLifeBars()
+{
+	local AOCBaseHUD H;
+	local AOCPawn Subject;
+
+	if (!IsLocalPlayerController())
+		return;
+
+	H = AOCBaseHUD(myHUD);
+
+	// CheckCanUseHUD() is false until the GFx HUD exists. Returning without recording
+	// anything means we simply try again next tick.
+	if (H == none || !H.CheckCanUseHUD())
+		return;
+
+	// Our own pawn wins; otherwise show whoever we are spectating.
+	Subject = AOCPawn(Pawn);
+	if (Subject == none)
+	{
+		Subject = AOCPawn(ViewTarget);
+
+		// Only for somebody we are allowed to watch. Without this it pushes health and
+		// stamina for whatever the view target happens to be -- including an enemy on the
+		// death camera.
+		if (Subject != none && !AdminModDWMayView(Subject.PlayerReplicationInfo))
+		{
+			AdminModDWNoteViewBlock('LifeBars');
+			Subject = none;
+		}
+	}
+
+	if (Subject == none || Subject.Health <= 0)
+	{
+		AdminModDWLifeBarPawn = none;
+		return;
+	}
+
+	// Re-assert visibility whenever the subject changes, and twice a second after that, so
+	// anything which hides the bars behind our back is corrected quickly.
+	if (Subject != AdminModDWLifeBarPawn || WorldInfo.TimeSeconds >= fAdminModDWNextLifeBarAssert)
+	{
+		AdminModDWLifeBarPawn = Subject;
+		fAdminModDWNextLifeBarAssert = WorldInfo.TimeSeconds + 0.5f;
+
+		H.DisplayCompleteHUD();
+
+		// Force a value push on the next two tests regardless of the change filter.
+		iAdminModDWLastHealthShown = -1;
+		fAdminModDWLastStaminaShown = -1.f;
+	}
+
+	if (Subject.Health != iAdminModDWLastHealthShown)
+	{
+		iAdminModDWLastHealthShown = Subject.Health;
+		H.SetHealthValues(Subject.Health, Subject.HealthMax);
+	}
+
+	if (Subject.Stamina != fAdminModDWLastStaminaShown)
+	{
+		fAdminModDWLastStaminaShown = Subject.Stamina;
+		H.SetStaminaValues(Subject.Stamina, Subject.MaxStamina);
+	}
+}
+
+/**
+ * Hold the spectator's field of view at the value they configured.
+ *
+ * There is no camera object in normal play -- AOCPlayerCamera extends Object, not Camera --
+ * so the engine reads FOVAngle directly, and the only thing that re-establishes a custom FOV
+ * is AOCPawn calling SetFOV on spawn. A spectator has no pawn, so anything that knocks those
+ * fields around on the way into spectate is permanent. state Spectating.GetPlayerViewPoint
+ * passes FOVAngle BY REFERENCE into CalcCamera, so any override writing out_FOV owns it.
+ * Assert the value instead of hunting the write.
+ *
+ * Gated on Pawn == none: weapon zoom drives DesiredFOV in live play and must not be fought.
+ */
+simulated function AdminModDWEnforceSpectateFOV(name Where)
+{
+	if (!IsLocalPlayerController() || Pawn != none)
+		return;
+
+	// Never invent a value. MyFOV is the same globalconfig the FOV exec writes and the pawn
+	// reads on spawn, so this holds spectate to exactly what live play uses.
+	if (MyFOV < 60.0 || MyFOV > 165.0)
+		return;
+
+	if (DefaultFOV == MyFOV && DesiredFOV == MyFOV && FOVAngle == MyFOV)
+		return;
+
+	// Record what we caught, so FPSpectateDebug can name the culprit.
+	if (FOVAngle != MyFOV)
+		fAdminModDWFOVCaught = FOVAngle;
+	else if (DesiredFOV != MyFOV)
+		fAdminModDWFOVCaught = DesiredFOV;
+	else
+		fAdminModDWFOVCaught = DefaultFOV;
+	nAdminModDWFOVCaughtWhere = Where;
+
+	DefaultFOV = MyFOV;
+	DesiredFOV = MyFOV;
+	FOVAngle   = MyFOV;
+}
+
+/** Console toggle, in case somebody wants to default to the vanilla orbit follow. */
+exec function FirstPersonSpectate(optional bool bEnable = true)
+{
+	bAdminModDWFPSpectate = bEnable;
+	if (IsInState('Spectating'))
+		AdminModDWApplySpectatorPerspective();
+}
+
+/**
+ * Diagnostic for first-person spectate. Type "FPSpectateDebug" in the console while
+ * following a player.
+ */
+exec function FPSpectateDebug()
+{
+	local AOCPawn P;
+
+	ClientDisplayConsoleMessage("---- AdminModDW camera / spectate state ----");
+	ClientDisplayConsoleMessage("State:" @ GetStateName() @ "| NetMode:" @ int(WorldInfo.NetMode) @ "| LocalPC:" @ IsLocalPlayerController());
+	ClientDisplayConsoleMessage("bAdminModDWFPSpectate:" @ bAdminModDWFPSpectate @ "| bBehindView:" @ bBehindView @ "| bFreeCamera:" @ bFreeCamera);
+	ClientDisplayConsoleMessage("Pawn:" @ Pawn);
+	ClientDisplayConsoleMessage("ViewTarget:" @ ViewTarget @ "| RealViewTarget:" @ RealViewTarget);
+
+	// A non-none PlayerCamera outside a CameraActor view is a camera lock: the engine reads
+	// the view straight off it and ignores Pawn/ViewTarget entirely.
+	ClientDisplayConsoleMessage("PlayerCamera:" @ PlayerCamera @ " <-- should be None during normal play");
+	ClientDisplayConsoleMessage("FOV: MyFOV=" $ MyFOV @ "Default=" $ DefaultFOV @ "Desired=" $ DesiredFOV @ "Angle=" $ FOVAngle);
+	ClientDisplayConsoleMessage("Drunk chain:" @ AdminModDWDrunkChain @ "(" $ AdminModDWDrunkChainPath $ ")");
+
+	if (iAdminModDWViewBlocks > 0)
+		ClientDisplayConsoleMessage("Team lock: refused" @ iAdminModDWViewBlocks @ "out-of-team view target(s), last in" @ nAdminModDWViewBlockWhere);
+	else
+		ClientDisplayConsoleMessage("Team lock: no out-of-team view target has been refused.");
+
+	if (nAdminModDWFOVCaughtWhere != '')
+		ClientDisplayConsoleMessage("FOV lock: last corrected a stray" @ fAdminModDWFOVCaught @ "in" @ nAdminModDWFOVCaughtWhere);
+	else
+		ClientDisplayConsoleMessage("FOV lock: has not had to correct anything yet.");
+
+	ClientDisplayConsoleMessage("FPObservedPawn:" @ AdminModDWFPObservedPawn @ "| PerspectivePawn:" @ AdminModDWPerspectivePawn);
+
+	if (Pawn != none && ViewTarget != Pawn)
+		ClientDisplayConsoleMessage("!! ViewTarget is not our own Pawn while we have one -- that is the frozen-camera signature.");
+
+	P = AOCPawn(ViewTarget);
+	if (P == none)
+	{
+		ClientDisplayConsoleMessage("ViewTarget is not an AOCPawn.");
+		ClientDisplayConsoleMessage("---------------------------------------");
+		return;
+	}
+
+	ClientDisplayConsoleMessage("Health:" @ P.Health @ "| bIsBot:" @ P.bIsBot @ "| LocallyControlled:" @ P.IsLocallyControlled());
+	ClientDisplayConsoleMessage("bIsBeingFPObserved:" @ P.bIsBeingFPObserved);
+	ClientDisplayConsoleMessage("OwnerMesh (1P component):" @ P.OwnerMesh);
+	ClientDisplayConsoleMessage("OwnerAimNode:" @ P.OwnerAimNode);
+	ClientDisplayConsoleMessage("PawnCharacter:" @ P.PawnCharacter);
+	if (P.PawnCharacter != none)
+		ClientDisplayConsoleMessage("  1P mesh asset:" @ P.PawnCharacter.default.OwnerMesh);
+	ClientDisplayConsoleMessage("HelmetAttachment.SkelComp:" @ P.HelmetAttachment.SkelComp);
+	ClientDisplayConsoleMessage("ShieldMesh:" @ P.ShieldMesh @ "| OverlayShieldMesh:" @ P.OverlayShieldMesh);
+	ClientDisplayConsoleMessage("WeaponAttachment:" @ AOCWeaponAttachment(P.CurrentWeaponAttachment));
+	if (AdminModDWCanFPObserve(P))
+		ClientDisplayConsoleMessage("=> CanFPObserve: TRUE");
+	else
+		ClientDisplayConsoleMessage("=> CanFPObserve: FALSE --" @ AdminModDWFPObserveBlocker(P));
+	ClientDisplayConsoleMessage("---------------------------------------");
+}
+
+state Spectating
+{
+	function BeginState(Name PreviousStateName)
+	{
+		super.BeginState(PreviousStateName);
+
+		// super sets SetViewTarget(none), so nothing is observed yet.
+		AdminModDWFPObservedPawn = none;
+		AdminModDWHUDPawn = none;
+		AdminModDWPerspectivePawn = none;
+
+		// Claim the field of view the moment we arrive, before the first frame renders.
+		AdminModDWEnforceSpectateFOV('BeginState');
+	}
+
+	function EndState(Name NextStateName)
+	{
+		AdminModDWClearFPObserve();
+
+		// Deliberately does NOT touch the HUD. Hiding here would undo vanilla a moment
+		// after it showed the bars: on spawn the server's Possess() fires
+		// ShowHUDElements() -> DisplayCompleteHUD() BEFORE ClientRestart() reaches
+		// EnterStartState(). AdminModDWEnforceLifeBars owns bar visibility; vanilla owns
+		// hiding on death.
+		AdminModDWLifeBarPawn = none;
+		AdminModDWHUDPawn = none;
+		AdminModDWPerspectivePawn = none;
+
+		super.EndState(NextStateName);
+	}
+
+	/**
+	 * Runs on the server (called from ServerViewNextPlayer / ServerViewPrevPlayer).
+	 *
+	 * Deliberately does NOT call super. Vanilla's version calls super.ViewAPlayer and then
+	 * SetBehindView(true), and because the server has no LocalPlayer that turns into a
+	 * ClientSetBehindView(true) RPC which drags the client back into third person on every
+	 * single target change. The client decides its own perspective in ClientSetViewTarget.
+	 *
+	 * SetReality is kept -- it is what puts the spectator in the observed player's reality,
+	 * and dropping it would show them the wrong world.
+	 */
+	function ViewAPlayer(int dir)
+	{
+		local PlayerReplicationInfo PRI;
+
+		PRI = GetNextViewablePlayer(dir);
+		if (PRI == None)
+			return;
+
+		// Belt and braces on top of GetNextViewablePlayer, which already consults
+		// AOCGame.CanSpectate for every candidate. If that gate works this is dead code and
+		// iAdminModDWViewBlocks stays at zero; if it leaks, this stops it on the server --
+		// where it matters, since a client cannot be trusted to refuse a view target it has
+		// already been given.
+		if (!AdminModDWMayView(PRI))
+		{
+			AdminModDWNoteViewBlock('ViewAPlayer');
+			return;
+		}
+
+		SetViewTarget(PRI);
+
+		if (ViewTarget != none)
+			SetReality(ViewTarget.RealityID);
+
+		ClientSetViewTarget(ViewTarget);
+	}
+
+	/** The client-side hook for "the view target changed" -- this is where perspective is applied. */
+	reliable client event ClientSetViewTarget( Actor A, optional ViewTargetTransitionParams TransitionParams )
+	{
+		// Restore the outgoing pawn before the native SetViewTarget inside super fires
+		// EndViewTarget on it (EndViewTarget does not restore its meshes).
+		if (AdminModDWFPObservedPawn != none && AdminModDWFPObservedPawn != A)
+			AdminModDWClearFPObserve();
+
+		super.ClientSetViewTarget(A, TransitionParams);
+
+		AdminModDWApplySpectatorPerspective();
+
+		AdminModDWHUDPawn = AOCPawn(ViewTarget);
+	}
+
+	/**
+	 * Left click / right click cycle the spectate target.
+	 *
+	 * Free for the taking: AOCPlayerController.state Spectating declares both of these as
+	 * empty stubs, so the mouse buttons do nothing at all while spectating today.
+	 */
+	exec function StartFire(optional byte FireModeNum)
+	{
+		SpectatorNext();
+	}
+
+	exec function StartAltFire(optional byte FireModeNum)
+	{
+		SpectatorPrevious();
+	}
+
+	/** Space. Toggles between first person and the vanilla orbit follow. */
+	exec function SpectatorPerspective()
+	{
+		if (AOCPawn(ViewTarget) == none)
+			return; // free camera / nobody followed -- nothing to toggle
+
+		bAdminModDWFPSpectate = !bAdminModDWFPSpectate;
+		AdminModDWApplySpectatorPerspective();
+	}
+
+	/** Same key path, reached via UTPlayerController.BehindView bindings. */
+	exec function BehindView()
+	{
+		SpectatorPerspective();
+	}
+
+	/** Camera angles only mean anything in the orbit follow. */
+	exec function NextCameraAngle()
+	{
+		if (bAdminModDWFPSpectate && AOCPawn(ViewTarget) != none)
+			return;
+
+		iThirdPersonAngle = 1;
+	}
+
+	/** Right click. */
+	exec function SpectatorFreecam()
+	{
+		AdminModDWClearFPObserve();
+		super.SpectatorFreecam();
+
+		// Restore bFreeCamera, which SetBehindView(false) zeroed on the way into first
+		// person. Without this the free camera is frozen in place.
+		SetBehindView(true);
+
+		AdminModDWHUDPawn = none;
+		AdminModDWPerspectivePawn = none;
+	}
+
+	/**
+	 * The last thing to run before the engine reads GetFOVAngle() for this frame.
+	 *
+	 * Vanilla's version hands FOVAngle to ViewTarget.CalcCamera as an out parameter, so a
+	 * view target is free to overwrite the spectator's field of view every single frame --
+	 * which a tick-time correction would lose to, since tick runs first.
+	 */
+	simulated event GetPlayerViewPoint( out vector POVLocation, out Rotator POVRotation )
+	{
+		super.GetPlayerViewPoint(POVLocation, POVRotation);
+		AdminModDWEnforceSpectateFOV('GetPlayerViewPoint');
+	}
+
+	event PlayerTick(float DeltaTime)
+	{
+		local AOCPawn P;
+
+		super.PlayerTick(DeltaTime);
+
+		// Covers whatever moves the value outside the render path.
+		AdminModDWEnforceSpectateFOV('PlayerTick');
+
+		if (!IsLocalPlayerController())
+			return;
+
+		P = AOCPawn(ViewTarget);
+		if (P != none && P.Health <= 0)
+			P = none; // dead: let the vanilla death camera / auto-advance take over
+
+		if (P == none)
+		{
+			if (AdminModDWFPObservedPawn != none)
+			{
+				AdminModDWClearFPObserve();
+				AdminModDWPerspectivePawn = none;
+				AdminModDWRestoreVanillaCamera();
+			}
+		}
+		else if (AdminModDWPerspectivePawn != P)
+		{
+			// New pawn (target switch, or the old one respawned as a new object).
+			// Establish a definite camera state exactly once.
+			AdminModDWApplySpectatorPerspective();
+		}
+		else if (bAdminModDWFPSpectate && !P.bIsBeingFPObserved
+			&& WorldInfo.TimeSeconds >= fAdminModDWNextFPRetry)
+		{
+			// Keep retrying first person on the pawn we already settled on -- a pawn can
+			// become network-relevant before its weapon attachment and helmet exist, and
+			// the blocker check refuses it until they do. Rate limited so a pawn that
+			// genuinely cannot be observed costs us nothing.
+			fAdminModDWNextFPRetry = WorldInfo.TimeSeconds + 0.5f;
+			AdminModDWApplyFPObserve(P);
+		}
+
+		// Keep the 1P mesh's aim offset fed.
+		// AOCPawn.FaceRotation() is the only thing that copies AimNode -> OwnerAimNode, and
+		// FaceRotation is only invoked for a locally controlled pawn. For a pawn we are
+		// merely observing it never runs, which would leave the 1P mesh -- and therefore the
+		// camera socket -- refusing to pitch with the observed player's aim.
+		if (P != none && P.bIsBeingFPObserved && P.OwnerAimNode != none && P.AimNode != none)
+		{
+			P.OwnerAimNode.Aim.X = P.AimNode.Aim.X;
+			P.OwnerAimNode.Aim.Y = P.AimNode.Aim.Y;
+		}
+
+		AdminModDWHUDPawn = P;
+	}
+}
+
+
+DefaultProperties
+{
+	// Empty on purpose: Deadliest Warrior's DEFAULT chain already carries the drunk and
+	// blackout effects, so there is nothing to swap in and no separate drunk chain to name.
+	// Only needed for a map that replaces the chain with one lacking them -- point this at a
+	// chain that has them and it is loaded by path at runtime, no rebuild involved.
+	AdminModDWDrunkChainPath=""
+}

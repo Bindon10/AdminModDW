@@ -1,0 +1,281 @@
+/**
+ * Shared game-side hooks for AdminModDW. Included by every AdminModDW gametype.
+ *
+ * AdminModDW changes no gameplay -- each gametype is the stock Deadliest Warrior one plus
+ * these overrides, all of which exist to serve RCON.
+ *
+ * Deadliest Warrior deltas from the base-game AdminMod are noted where they matter; the
+ * full list is in RCON_PROTOCOL.md.
+ */
+
+// Map prefix -> AdminModDW gametype, from DefaultAdminModDW.ini. Without this the engine
+// resolves the prefix to the vanilla CDW class and none of the below ever runs.
+var config array<GameTypePrefix> SDKPrefixes;
+
+static event class<GameInfo> SetGameType(string MapName, string Options, string Portal)
+{
+	local string ThisMapPrefix;
+	local int i, pos;
+	local class<GameInfo> NewGameType;
+
+	// An explicit ?game= wins, because the super we fall through to says so.
+	//
+	// Only UTGame overrides SetGameType in this chain -- AOCGame extends UTTeamGame extends
+	// UTDeathmatch extends UTGame, and neither middle class touches it -- and UTGame's
+	// version opens with exactly this test. So the table below was pre-empting the vanilla
+	// behaviour it is standing in front of. Alignment, not a fix for any observed symptom.
+	//
+	// Note the map prefix is normally the right answer anyway: Deadliest Warrior ships every
+	// arena under five mode prefixes (FFA-Moor, TD-Moor, LTS-Moor, HTB-Moor, PTB-Moor), so a
+	// mode is selected by picking the matching copy of the map, not by overriding the game on
+	// an FFA map. This guard is for the case where an admin does state the mode explicitly.
+	if (ParseOption(Options, "Game") != "")
+		return Default.Class;
+
+	MapName = StripPlayOnPrefix(MapName);
+	pos = InStr(MapName, "-");
+	ThisMapPrefix = Left(MapName, pos);
+
+	for (i = 0; i < default.SDKPrefixes.length; i++)
+	{
+		if (default.SDKPrefixes[i].Prefix ~= ThisMapPrefix)
+		{
+			NewGameType = class<GameInfo>(DynamicLoadObject(default.SDKPrefixes[i].GameType, class'Class'));
+			if (NewGameType != None)
+				return NewGameType;
+		}
+	}
+
+	return super.SetGameType(MapName, Options, Portal);
+}
+
+/**
+ * Opcode 42 (mute) sets AOCPRI.bIsAdminMuted, but vanilla only checks that flag in
+ * AOCPlayerController.ReceiveChatMessage, and skips the check for Steam friends of the
+ * muted player and for the muted player's own copy -- so a muted player still sees
+ * themselves talking and mute looks broken. Drop the message server-side instead.
+ */
+function BroadcastMessage(PlayerController Sender, string Message, EAOCFaction DesignatedTeam, optional bool bSystemMessage = false, optional bool bUseCustomColor = false, optional string Col)
+{
+    local AOCPRI SenderPRI;
+    local AOCPlayerController SenderPC;
+
+    SenderPC = AOCPlayerController(Sender);
+
+    // Readiness commands are consumed before the mute check on purpose: readying up is a
+    // game action rather than talking, so a text-muted player may still do it.
+    if (!bSystemMessage && SenderPC != none && AdminModDWRCon(RemoteConsole) != none
+        && AdminModDWRCon(RemoteConsole).AdminModDWHandleReadyCommand(SenderPC, Message))
+        return;
+
+    if (!bSystemMessage && SenderPC != none)
+    {
+        SenderPRI = AOCPRI(SenderPC.PlayerReplicationInfo);
+        if (SenderPRI != none && SenderPRI.bIsAdminMuted)
+        {
+            // Tell the sender only, so mute is not silently confusing to them.
+            //
+            // DW delta: ReceiveChatMessage takes a leading PlayerName here
+            // (AOCPlayerController.uc:3295); the base game's has no such parameter. Passing
+            // the base game's argument list makes the message land in PlayerName and
+            // EFAC_ALL land in Message, which is the "Bad or missing expression for token:
+            // EFAC_ALL" the compiler reports. Empty name = a server line, matching how
+            // vanilla sends its own notices (AOCGame.uc:604).
+            SenderPC.ReceiveChatMessage("", "You are muted by an admin.", EFAC_ALL, false, true, "#FF5555");
+            return;
+        }
+    }
+
+    super.BroadcastMessage(Sender, Message, DesignatedTeam, bSystemMessage, bUseCustomColor, Col);
+}
+
+/**
+ * Tournament ready gate (opcodes 49 and 50).
+ *
+ * Deadliest Warrior has no tournament mode and, importantly, **no readiness concept to
+ * borrow**. AOCPlayerController.bReady looks like one and is not: SetReady(true) fires on
+ * closing team select or confirming a loadout, SetReady(false) on opening either
+ * (AOCGFx_TeamSelection.uc:126, AOCView_Loadout.uc:936, AOCBaseHUD.uc:2022/2038/2058).
+ * Vanilla ShouldCountDown uses it as a join gate -- "enough people have picked a class" --
+ * and a tournament built on it is satisfied the instant everyone spawns, then un-satisfied
+ * again whenever somebody opens their loadout. An earlier version of this made exactly that
+ * mistake and did nothing observable.
+ *
+ * So the mod keeps its own ready list (AdminModDWRCon.AdminModDWReadyIds), driven by !ready
+ * in chat, and this override gates on that instead. State lives on the RCON actor because
+ * the nine AdminModDW gametypes have no common base to hang a var on, and that actor already
+ * survives seamless travel. No RemoteConsole means no dedicated server, so vanilla stands.
+ */
+function bool ShouldCountDown()
+{
+	local AdminModDWRCon RCon;
+	local AOCPlayerController PC;
+	local AOCAICombatController AIPC;
+	local array<int> TotalOnTeam, ReadyOnTeam;
+	local int i, TeamIdx, NumTeamsReady, NumTeamsPopulated;
+
+	RCon = AdminModDWRCon(RemoteConsole);
+
+	if (RCon == none || !RCon.bAdminModDWTournamentMode)
+		return super.ShouldCountDown();
+
+	// Admin forced everyone ready (opcode 50). Latched until an admin clears it, so a
+	// player joining mid-countdown cannot pull the round back into waiting.
+	if (RCon.bAdminModDWForcedReady)
+		return true;
+
+	TotalOnTeam.Length = Teams.Length;
+	ReadyOnTeam.Length = Teams.Length;
+
+	foreach WorldInfo.AllControllers(class'AOCPlayerController', PC)
+	{
+		if (PC.IsVoluntarySpectator() || PC.PlayerReplicationInfo == none
+			|| PC.PlayerReplicationInfo.Team == none || PC.PlayerReplicationInfo.bOnlySpectator)
+			continue;
+
+		TeamIdx = PC.PlayerReplicationInfo.Team.TeamIndex;
+		if (TeamIdx < 0 || TeamIdx >= TotalOnTeam.Length)
+			continue;
+
+		TotalOnTeam[TeamIdx]++;
+		if (RCon.AdminModDWIsPlayerReady(PC.PlayerReplicationInfo))
+			ReadyOnTeam[TeamIdx]++;
+	}
+
+	// Bots are always ready -- vanilla ShouldCountDown treats them the same way.
+	foreach WorldInfo.AllControllers(class'AOCAICombatController', AIPC)
+	{
+		if (AIPC.PlayerReplicationInfo == none || AIPC.PlayerReplicationInfo.Team == none)
+			continue;
+
+		TeamIdx = AIPC.PlayerReplicationInfo.Team.TeamIndex;
+		if (TeamIdx < 0 || TeamIdx >= TotalOnTeam.Length)
+			continue;
+
+		TotalOnTeam[TeamIdx]++;
+		ReadyOnTeam[TeamIdx]++;
+	}
+
+	for (i = 0; i < Teams.Length; i++)
+	{
+		if (Teams[i] == none || AOCTeamInfo_Spectators(Teams[i]) != none)
+			continue;
+
+		if (TotalOnTeam[i] == 0)
+			continue;
+
+		NumTeamsPopulated++;
+
+		if (float(ReadyOnTeam[i]) >= float(TotalOnTeam[i]) * RCon.AdminModDWReadyThreshold)
+			NumTeamsReady++;
+	}
+
+	// EVERY populated team has to clear the threshold, unlike vanilla's "any two teams have
+	// somebody ready". A tournament that starts while one side is still picking loadouts is
+	// the thing this exists to prevent.
+	//
+	// The second test keeps a one-sided match from starting, but only where the mode actually
+	// has more than one team -- FFA and Duel run NumTeams=1 and would otherwise be held
+	// forever.
+	if (NumTeamsPopulated == 0
+		|| NumTeamsReady < NumTeamsPopulated
+		|| (NumTeamsPopulated < 2 && Teams.Length > 1 && NumTeams > 1))
+	{
+		RCon.AdminModDWAnnounceStillWaiting();
+		return false;
+	}
+
+	return true;
+}
+
+/** Readiness is per round, so a round starting wipes it for the next pre-round. */
+function StartRound()
+{
+	local AdminModDWRCon RCon;
+
+	super.StartRound();
+
+	RCon = AdminModDWRCon(RemoteConsole);
+	if (RCon != none && RCon.bAdminModDWTournamentMode)
+		RCon.AdminModDWClearReady();
+}
+
+/**
+ * Spawn AdminModDW's remote console instead of the vanilla one. AOCGame.InitRemoteConsole
+ * hardcodes Spawn(class'AOCRCon'), so this is the only hook needed -- AdminModDWRCon
+ * extends AOCRCon, so vanilla opcodes, auth and the GameEvent_* calls keep working
+ * untouched. The AllActors sweep and dedicated-server check are vanilla's, kept verbatim.
+ */
+function InitRemoteConsole(string Options)
+{
+	local AOCRCon RCon;
+
+	if (WorldInfo.NetMode != NM_DedicatedServer)
+		return;
+
+	// Reuse the console carried over from before the map change, if there is one.
+	// Sessions are AOCRCon subclasses too, so skip them -- adopting one as RemoteConsole
+	// would point the whole server's event stream at a single client's socket.
+	foreach WorldInfo.AllActors(class'AOCRCon', RCon)
+	{
+		if (AdminModDWRConSession(RCon) != none)
+			continue;
+
+		RemoteConsole = RCon;
+		break;
+	}
+
+	if (RemoteConsole == none)
+	{
+		RemoteConsole = Spawn(class'AdminModDWRCon');
+		LogAlwaysInternal("[AdminModDWRCon] remote console started (extended opcodes 23-64 available)");
+	}
+
+	// The travel-time push reported the map being left, so announce the real one now that
+	// it is current. Sessions survive travel, so this reaches everyone already connected.
+	RemoteConsole.GameEvent_MapChanged(GetCurrentMap(), MapCycleIndex);
+}
+
+/**
+ * Carry the RCON sessions across a seamless map change, not just the listener. Without
+ * this the session actors are destroyed with the old world and every connected client
+ * drops on each map change.
+ *
+ * Only does anything if the travel is actually seamless -- a full ServerTravel tears down
+ * the world regardless, and clients must reconnect.
+ */
+function GetSeamlessTravelActorList(bool bToEntry, out array<Actor> ActorList)
+{
+	local AdminModDWRCon Listener;
+	local int i;
+
+	super.GetSeamlessTravelActorList(bToEntry, ActorList);
+
+	Listener = AdminModDWRCon(RemoteConsole);
+	if (Listener == none)
+		return;
+
+	ActorList[ActorList.Length] = Listener;
+
+	for (i = 0; i < Listener.Sessions.Length; i++)
+	{
+		if (Listener.Sessions[i] != none)
+			ActorList[ActorList.Length] = Listener.Sessions[i];
+	}
+
+	LogAlwaysInternal("[AdminModDWRCon] carrying" @ Listener.Sessions.Length @ "session(s) through travel");
+}
+
+DefaultProperties
+{
+	// Without this the server browser shows AOCGame's default, "An Unnamed Mod".
+	ModDisplayString="AdminModDW"
+
+	// Only so opcodes 26/48 reach AdminModDWPlayerController.ClientInebriate. The
+	// controller is otherwise the stock one for this mode.
+	PlayerControllerClass=class'`{GAMEMODE}PlayerController'
+
+	// First-person spectate needs AdminModDWPawn.uci's hooks on the observed pawn.
+	// PAWNCLASS keeps vanilla's per-mode parent (AOCTUTPawn / CDWDuelPawn) intact.
+	DefaultPawnClass=class'`{PAWNCLASS}'
+}

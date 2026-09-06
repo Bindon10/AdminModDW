@@ -1,0 +1,3 @@
+class AdminModDWPTBPlayerController extends CDWCTFPlayerController;
+
+`include(AdminModDW/Include/AdminModDWPlayerController.uci)

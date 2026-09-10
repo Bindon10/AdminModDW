@@ -169,6 +169,56 @@ replaces the chain with one lacking the nodes. `AdminModDWDrunkChainPath` in
 
 ---
 
+### 44 — END_MATCH
+
+Deadliest Warrior's `AOCFFA.EndGame` gates its whole body on `Reason ~= "TimeLimit"`. Medieval Warfare's
+copy also accepts `"Admin action"`; DW's does not. Any other string is a silent no-op — the packet is
+handled, the audit fires, and the match never ends. So the handler passes `"TimeLimit"` in both games.
+Every base `AOCGame` mode ignores Reason beyond `EndLogging`, so nothing is lost.
+
+`winningTeam` does not choose the winner: `EndGame` opens with `WinningTeam = GetWinningTeam()`, read off
+the live scores. The parameter only picks whose top scorer is spotlighted. Set the scores with opcode 34
+first if a specific team has to win.
+
+---
+
+### 62 / 63 / 64 — MUTE_LIST_REQUEST, MUTE_INFO, MUTE_LIST_END
+
+`MUTE_INFO` gained a trailing `int stored`. 0 marks a live mute the mod never recorded:
+`AOCPlayerController.AdminMutePlayer` (Medieval Warfare calls it `ServerAdminMutePlayer`) writes
+`AOCPRI.bIsAdminMuted` straight and never touches the stored list, so it is a real mute that lasts only
+until that player disconnects. A client that stops reading after `online` treats everything as stored,
+which is what a pre-1.4 server meant.
+
+---
+
+### 39 / 40 / 41 — BAN_LIST_REQUEST, BAN_INFO, BAN_LIST_END
+
+No DW delta in the wire format, but the handler was widened in both games at the same time and
+the reason applies identically here. Chivalry enforces **three** ban stores and the mod used to
+report only the first:
+
+- `AOCAccessControl.Bans` — rich entries (name, reason, duration, IP policy). Written by
+  `AddBan`/`KickBanGlobal`, i.e. the RCON ban, votekick and the ping kick.
+- `Engine.AccessControl.BannedIDs` — bare uids, written by the console `admin kickban`.
+  `AOCAccessControl.IsIDBanned` ends with `return bBanned || Super.IsIDBanned(NetID)`
+  (`AOCAccessControl.uc:242` in the CDW tree), so these are live bans. Sent as
+  `(uid ban list)`, duration 0, because the game stores nothing else about them.
+- `Engine.AccessControl.IPPolicies` — `DENY,<ip>` lines, live through
+  `Super.CheckIPPolicy`. Sent with uid 0 and name `(ip ban)`; they cannot be lifted by uid,
+  they have to come out of the ini.
+
+`KickBanPlayer` appends the DENY line and the `BannedIDs` entry in the same call, so when the two arrays
+pair one-for-one the Nth policy rides on the Nth uid's row instead of becoming a separate entry. The address
+is empty in practice — a Steam socket address has no `:port`, so `Left(IP, InStr(IP, ":"))` returns "" — and
+a bare `DENY,` matches no address in `CheckIPPolicy`, so it is never listed as a ban.
+
+Entries already covered by `Bans` are not repeated, and `BAN_LIST_END` counts everything sent.
+Opcode 20 (UNBAN_PLAYER) now also removes from `BannedIDs` — and its paired DENY line — since `UnbanByUID`
+only touches `Bans` and an entry shown as `(uid ban list)` would otherwise never actually lift.
+
+---
+
 ## Gametypes and map prefixes
 
 Claimed in `DefaultAdminModDW.ini`, taken from each DW gametype's own `MapPrefixes` default:
